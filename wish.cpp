@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <sstream>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -12,6 +13,61 @@ using namespace std;
 void PrintOstepError() {
     char error_message[30] = "An error has occurred\n";
     write(STDERR_FILENO, error_message, strlen(error_message));
+}
+
+// Глобальний список директорій для пошуку виконуваних файлів
+vector<string> gSearchPath = {"/bin"};
+
+// Розбиває введений рядок на окремі аргументи (токени)
+vector<string> Tokenize(const string &line) {
+    vector<string> tokens;
+    istringstream iss(line);
+    string token;
+
+    while (iss >> token) {
+        tokens.push_back(token);
+    }
+
+    return tokens;
+}
+
+enum class BuiltinResult {
+    kNotBuiltin,
+    kHandled
+};
+
+// Обробка вбудованих команд (exit, cd, path)
+BuiltinResult TryRunBuiltin(const vector<string> &tokens) {
+    const string &cmd = tokens[0];
+
+    if (cmd == "exit") {
+        // Команда exit не повинна приймати аргументів
+        if (tokens.size() != 1) {
+            PrintOstepError();
+        } else {
+            exit(0);
+        }
+        return BuiltinResult::kHandled;
+    }
+
+    if (cmd == "cd") {
+        // Команда cd вимагає рівно один аргумент
+        if (tokens.size() != 2) {
+            PrintOstepError();
+        } else if (chdir(tokens[1].c_str()) != 0) {
+            // Помилка при зміні директорії
+            PrintOstepError();
+        }
+        return BuiltinResult::kHandled;
+    }
+
+    if (cmd == "path") {
+        // Перезапис списку шляхів пошуку
+        gSearchPath.assign(tokens.begin() + 1, tokens.end());
+        return BuiltinResult::kHandled;
+    }
+
+    return BuiltinResult::kNotBuiltin;
 }
 
 int main(int argc, char *argv[]) {
@@ -26,14 +82,12 @@ int main(int argc, char *argv[]) {
         isBatchMode = true;
         batchFile.open(argv[1]);
         
-        // Перевірка на успішне відкриття файлу
         if (!batchFile.is_open()) {
             PrintOstepError();
             exit(1);
         }
         inputStream = &batchFile;
     } else {
-        // Помилка: передано більше одного аргументу
         PrintOstepError();
         exit(1);
     }
@@ -52,8 +106,14 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Пропуск порожніх рядків
-        if (line.empty()) {
+        // Токенізація рядка
+        vector<string> tokens = Tokenize(line);
+        if (tokens.empty()) {
+            continue;
+        }
+
+        // Перевірка та запуск вбудованих команд
+        if (TryRunBuiltin(tokens) == BuiltinResult::kHandled) {
             continue;
         }
     }
