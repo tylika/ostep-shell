@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
+#include <sys/wait.h>
 
 using namespace std;
 
@@ -27,7 +28,6 @@ vector<string> Tokenize(const string &line) {
     while (iss >> token) {
         tokens.push_back(token);
     }
-
     return tokens;
 }
 
@@ -41,7 +41,6 @@ BuiltinResult TryRunBuiltin(const vector<string> &tokens) {
     const string &cmd = tokens[0];
 
     if (cmd == "exit") {
-        // Команда exit не повинна приймати аргументів
         if (tokens.size() != 1) {
             PrintOstepError();
         } else {
@@ -51,18 +50,15 @@ BuiltinResult TryRunBuiltin(const vector<string> &tokens) {
     }
 
     if (cmd == "cd") {
-        // Команда cd вимагає рівно один аргумент
         if (tokens.size() != 2) {
             PrintOstepError();
         } else if (chdir(tokens[1].c_str()) != 0) {
-            // Помилка при зміні директорії
             PrintOstepError();
         }
         return BuiltinResult::kHandled;
     }
 
     if (cmd == "path") {
-        // Перезапис списку шляхів пошуку
         gSearchPath.assign(tokens.begin() + 1, tokens.end());
         return BuiltinResult::kHandled;
     }
@@ -70,18 +66,68 @@ BuiltinResult TryRunBuiltin(const vector<string> &tokens) {
     return BuiltinResult::kNotBuiltin;
 }
 
+// Перевіряє наявність файлу та права на виконання у вказаних директоріях
+string FindExecutable(const string &command) {
+    for (const string &dir : gSearchPath) {
+        string candidate = dir + "/" + command;
+        if (access(candidate.c_str(), X_OK) == 0) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+// Запуск зовнішньої програми у дочірньому процесі
+void ExecuteCommand(const vector<string> &args) {
+    string executablePath = FindExecutable(args[0]);
+
+    if (executablePath.empty()) {
+        PrintOstepError();
+        return;
+    }
+
+    // Створення нового процесу
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        PrintOstepError();
+        return;
+    }
+
+    if (pid == 0) {
+        // Логіка дочірнього процесу: підготовка аргументів для execv
+        vector<char *> execArgs;
+        execArgs.reserve(args.size() + 1);
+
+        for (const string &arg : args) {
+            execArgs.push_back(const_cast<char *>(arg.c_str()));
+        }
+        execArgs.push_back(nullptr); // Обов'язковий null-термінатор
+
+        // Заміна образу процесу на нову програму
+        execv(executablePath.c_str(), execArgs.data());
+
+        // Якщо execv повернув керування — сталася помилка
+        PrintOstepError();
+        exit(1);
+    } else {
+        // Логіка батьківського процесу: очікування завершення дочірнього
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
 int main(int argc, char *argv[]) {
     bool isBatchMode = false;
     ifstream batchFile;
     istream *inputStream = &cin;
 
-    // Визначення режиму роботи (Interactive або Batch)
+    // Визначення режиму роботи
     if (argc == 1) {
         isBatchMode = false;
     } else if (argc == 2) {
         isBatchMode = true;
         batchFile.open(argv[1]);
-        
         if (!batchFile.is_open()) {
             PrintOstepError();
             exit(1);
@@ -96,26 +142,24 @@ int main(int argc, char *argv[]) {
 
     // Головний цикл оболонки
     while (true) {
-        // Виведення запрошення лише в інтерактивному режимі
         if (!isBatchMode) {
             cout << "wish> ";
         }
 
-        // Читання рядка та перевірка на кінець файлу (EOF)
         if (!getline(*inputStream, line)) {
-            break;
+            break; // Вихід при EOF
         }
 
-        // Токенізація рядка
         vector<string> tokens = Tokenize(line);
         if (tokens.empty()) {
             continue;
         }
 
-        // Перевірка та запуск вбудованих команд
         if (TryRunBuiltin(tokens) == BuiltinResult::kHandled) {
             continue;
         }
+
+        ExecuteCommand(tokens);
     }
 
     return 0;
