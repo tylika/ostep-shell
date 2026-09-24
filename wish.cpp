@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 using namespace std;
 
@@ -16,7 +18,6 @@ void PrintOstepError() {
     write(STDERR_FILENO, error_message, strlen(error_message));
 }
 
-// Глобальний список директорій для пошуку виконуваних файлів
 vector<string> gSearchPath = {"/bin"};
 
 // Розбиває введений рядок на окремі аргументи (токени)
@@ -31,42 +32,76 @@ vector<string> Tokenize(const string &line) {
     return tokens;
 }
 
-enum class BuiltinResult {
-    kNotBuiltin,
-    kHandled
-};
+// Відокремлює символ перенаправлення пробілами для коректної токенізації
+string PadRedirectionOperator(const string &line) {
+    string result;
+    result.reserve(line.size());
+
+    for (char c : line) {
+        if (c == '>') {
+            result += " > ";
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
+
+// Виокремлює файл перенаправлення та перевіряє синтаксис
+bool SplitOnRedirection(const vector<string> &tokens, vector<string> &commandArgs, string &outputFile) {
+    commandArgs.clear();
+    outputFile.clear();
+
+    int redirectCount = 0;
+    size_t redirectPos = 0;
+
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (tokens[i] == ">") {
+            redirectCount++;
+            redirectPos = i;
+        }
+    }
+
+    // Перенаправлення відсутнє
+    if (redirectCount == 0) {
+        commandArgs = tokens;
+        return true; 
+    }
+
+    // Перевірка на помилки синтаксису (більше одного '>', відсутність файлу або команди)
+    if (redirectCount > 1 || (tokens.size() - redirectPos - 1) != 1 || redirectPos == 0) {
+        return false;
+    }
+
+    commandArgs.assign(tokens.begin(), tokens.begin() + redirectPos);
+    outputFile = tokens[redirectPos + 1];
+    return true;
+}
+
+enum class BuiltinResult { kNotBuiltin, kHandled };
 
 // Обробка вбудованих команд (exit, cd, path)
 BuiltinResult TryRunBuiltin(const vector<string> &tokens) {
     const string &cmd = tokens[0];
 
     if (cmd == "exit") {
-        if (tokens.size() != 1) {
-            PrintOstepError();
-        } else {
-            exit(0);
-        }
+        if (tokens.size() != 1) PrintOstepError();
+        else exit(0);
         return BuiltinResult::kHandled;
     }
-
     if (cmd == "cd") {
-        if (tokens.size() != 2) {
-            PrintOstepError();
-        } else if (chdir(tokens[1].c_str()) != 0) {
-            PrintOstepError();
-        }
+        if (tokens.size() != 2) PrintOstepError();
+        else if (chdir(tokens[1].c_str()) != 0) PrintOstepError();
         return BuiltinResult::kHandled;
     }
-
     if (cmd == "path") {
         gSearchPath.assign(tokens.begin() + 1, tokens.end());
         return BuiltinResult::kHandled;
     }
-
     return BuiltinResult::kNotBuiltin;
 }
 
-// Перевіряє наявність файлу та права на виконання у вказаних директоріях
+// Перевіряє наявність файлу та права на виконання
 string FindExecutable(const string &command) {
     for (const string &dir : gSearchPath) {
         string candidate = dir + "/" + command;
@@ -77,8 +112,8 @@ string FindExecutable(const string &command) {
     return "";
 }
 
-// Запуск зовнішньої програми у дочірньому процесі
-void ExecuteCommand(const vector<string> &args) {
+// Запуск зовнішньої програми з можливим перенаправленням виводу
+void ExecuteCommand(const vector<string> &args, const string &outputFile) {
     string executablePath = FindExecutable(args[0]);
 
     if (executablePath.empty()) {
@@ -86,7 +121,6 @@ void ExecuteCommand(const vector<string> &args) {
         return;
     }
 
-    // Створення нового процесу
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -95,23 +129,35 @@ void ExecuteCommand(const vector<string> &args) {
     }
 
     if (pid == 0) {
-        // Логіка дочірнього процесу: підготовка аргументів для execv
+        // Логіка дочірнього процесу: обробка перенаправлення stdout/stderr
+        if (!outputFile.empty()) {
+            int fd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+            if (fd < 0) {
+                PrintOstepError();
+                exit(1);
+            }
+
+            // Перенаправлення стандартного виводу та потоку помилок у файл
+            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+                PrintOstepError();
+                exit(1);
+            }
+            close(fd);
+        }
+
+        // Підготовка аргументів для execv
         vector<char *> execArgs;
         execArgs.reserve(args.size() + 1);
-
         for (const string &arg : args) {
             execArgs.push_back(const_cast<char *>(arg.c_str()));
         }
-        execArgs.push_back(nullptr); // Обов'язковий null-термінатор
+        execArgs.push_back(nullptr);
 
-        // Заміна образу процесу на нову програму
         execv(executablePath.c_str(), execArgs.data());
-
-        // Якщо execv повернув керування — сталася помилка
         PrintOstepError();
         exit(1);
     } else {
-        // Логіка батьківського процесу: очікування завершення дочірнього
+        // Батьківський процес чекає завершення команди
         int status;
         waitpid(pid, &status, 0);
     }
@@ -122,7 +168,6 @@ int main(int argc, char *argv[]) {
     ifstream batchFile;
     istream *inputStream = &cin;
 
-    // Визначення режиму роботи
     if (argc == 1) {
         isBatchMode = false;
     } else if (argc == 2) {
@@ -140,26 +185,26 @@ int main(int argc, char *argv[]) {
 
     string line;
 
-    // Головний цикл оболонки
     while (true) {
-        if (!isBatchMode) {
-            cout << "wish> ";
-        }
+        if (!isBatchMode) cout << "wish> ";
+        if (!getline(*inputStream, line)) break;
 
-        if (!getline(*inputStream, line)) {
-            break; // Вихід при EOF
-        }
+        vector<string> tokens = Tokenize(PadRedirectionOperator(line));
+        if (tokens.empty()) continue;
 
-        vector<string> tokens = Tokenize(line);
-        if (tokens.empty()) {
+        vector<string> commandArgs;
+        string outputFile;
+        
+        if (!SplitOnRedirection(tokens, commandArgs, outputFile)) {
+            PrintOstepError();
             continue;
         }
 
-        if (TryRunBuiltin(tokens) == BuiltinResult::kHandled) {
+        if (TryRunBuiltin(commandArgs) == BuiltinResult::kHandled) {
             continue;
         }
 
-        ExecuteCommand(tokens);
+        ExecuteCommand(commandArgs, outputFile);
     }
 
     return 0;
